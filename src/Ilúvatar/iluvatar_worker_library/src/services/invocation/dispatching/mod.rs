@@ -8,7 +8,7 @@ pub mod landlord;
 pub mod popular;
 pub mod queueing_dispatcher;
 pub mod weighted_random;
-// mod mice;
+mod mice;
 
 #[derive(Debug, Copy, Clone, serde::Serialize, serde::Deserialize)]
 /// The policy by which polymorphic functions will be enqueued in the CPU/GPU/etc. queues
