@@ -1,0 +1,28 @@
+[package]
+name = "iluvatar_worker"
+description = "Executes and manages isolation for function invocations on a particular node."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+categories.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+iluvatar_library = { path = "../iluvatar_library" }
+iluvatar_rpc = { path = "../iluvatar_rpc" }
+iluvatar_worker_library = { path = "../iluvatar_worker_library" }
+iluvatar_controller_library = { path = "../iluvatar_controller_library" }
+tonic = "0.12"
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "test-util", "parking_lot"] }
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tikv-jemallocator = "0.6"
+
+[lints]
+workspace = true

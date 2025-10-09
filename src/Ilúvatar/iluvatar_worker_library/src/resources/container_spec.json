@@ -1,0 +1,194 @@
+{
+    "ociVersion": "1.0.0-rc2-dev",
+    "platform": {
+        "os": "linux",
+        "arch": "amd64"
+    },
+    "process": {
+        "terminal": false,
+        "consoleSize": {
+            "height": 0,
+            "width": 0
+        },
+        "user": {
+            "uid": 0,
+            "gid": 0
+        },
+        "args": [ "/usr/local/bin/gunicorn", "server:app"],
+        "env": [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "TERM=xterm",
+            "__IL_PORT=$PORT",
+            "__IL_HOST=$HOST_ADDR",
+            "__IL_SOCKET=$SOCK/sock",
+            "FLASK_APP=server",
+            "FLASK_RUN_PORT=$PORT",
+            "FLASK_RUN_HOST=$HOST_ADDR",
+            "GUNICORN_CMD_ARGS=--workers=1 --timeout=$INVOKE_TIMEOUT --bind=$HOST_ADDR:$PORT"
+        ],
+        "cwd": "/app",
+        "rlimits": [{
+            "type": "RLIMIT_NOFILE",
+            "hard": 1024,
+            "soft": 1024
+        }],
+        "noNewPrivileges": true
+    },
+    "root": {
+        "path": "$ROOTFS",
+        "readonly": false
+    },
+    "hostname": "test",
+    "mounts": [{
+            "destination": "/proc",
+            "type": "proc",
+            "source": "proc"
+        },
+        {
+            "destination": "/tmp",
+            "type": "tmpfs",
+            "source": "tmpfs"
+        },
+        {
+            "source": "/tmp/iluvatar/$CTR_ID/",
+            "destination": "$SOCK",
+            "options": [ "rw", "bind" ],
+            "type": "none"
+        },
+        {
+            "destination": "/dev",
+            "type": "tmpfs",
+            "source": "tmpfs",
+            "options": [
+                "nosuid",
+                "strictatime",
+                "mode=755",
+                "size=65536k"
+            ]
+        },
+        {
+            "destination": "/dev/pts",
+            "type": "devpts",
+            "source": "devpts",
+            "options": [
+                "nosuid",
+                "noexec",
+                "newinstance",
+                "ptmxmode=0666",
+                "mode=0620",
+                "gid=5"
+            ]
+        },
+        {
+            "destination": "/dev/shm",
+            "type": "tmpfs",
+            "source": "shm",
+            "options": [
+                "nosuid",
+                "noexec",
+                "nodev",
+                "mode=1777",
+                "size=65536k"
+            ]
+        },
+        {
+            "destination": "/dev/mqueue",
+            "type": "mqueue",
+            "source": "mqueue",
+            "options": [
+                "nosuid",
+                "noexec",
+                "nodev"
+            ]
+        },
+        {
+            "destination": "/sys",
+            "type": "sysfs",
+            "source": "sysfs",
+            "options": [
+                "nosuid",
+                "noexec",
+                "nodev",
+                "ro"
+            ]
+        },
+        {
+            "destination": "/sys/fs/cgroup",
+            "type": "cgroup",
+            "source": "cgroup",
+            "options": [
+                "nosuid",
+                "noexec",
+                "nodev",
+                "relatime",
+                "ro"
+            ]
+        },
+        {
+            "destination": "/etc/resolv.conf",
+            "type": "none",
+            "source": "$RESOLV_CONF",
+            "options": [ "ro", "bind" ]
+        }
+    ],
+    "hooks": {},
+    "linux": {
+        "devices": [],
+        "cgroupsPath": "$CGROUPSPATH",
+        "resources": {
+          "devices": [
+              {"allow":false,"access":"rwm"},
+              {"allow":true,"type":"c","major":1,"minor":3,"access":"rwm"},
+              {"allow":true,"type":"c","major":1,"minor":5,"access":"rwm"},
+              {"allow":true,"type":"c","major":1,"minor":8,"access":"rwm"},
+              {"allow":true,"type":"c","major":1,"minor":9,"access":"rwm"},
+              {"allow":true,"type":"c","major":5,"minor":0,"access":"rwm"},
+              {"allow":true,"type":"c","major":5,"minor":1,"access":"rwm"}
+          ],
+          "memory": {
+            "limit": "$MEMLIMIT"
+          },
+          "cpu": {
+            "quota": "$CPUQUOTA",
+            "period": "$CPUPERIOD"
+          }
+        },
+        "namespaces": [
+          {
+            "type":"pid"
+          },
+          {
+            "type": "network",
+            "path": "$NET_NS"
+          },
+          {
+            "type":"ipc"
+          },
+          {
+            "type": "uts"
+          },
+          {
+            "type": "mount"
+          },
+          {
+            "type":"cgroup"
+          }
+        ],
+        "maskedPaths": [
+            "/proc/kcore",
+            "/proc/latency_stats",
+            "/proc/timer_list",
+            "/proc/timer_stats",
+            "/proc/sched_debug",
+            "/sys/firmware"
+        ],
+        "readonlyPaths": [
+            "/proc/asound",
+            "/proc/bus",
+            "/proc/fs",
+            "/proc/irq",
+            "/proc/sys",
+            "/proc/sysrq-trigger"
+        ]
+    }
+}

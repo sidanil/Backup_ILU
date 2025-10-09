@@ -1,0 +1,209 @@
+use crate::services::invocation::dispatching::queueing_dispatcher::DispatchPolicy;
+use crate::services::invocation::dispatching::{QueueMap, NO_ESTIMATE};
+use crate::services::invocation::queueing::DeviceQueue;
+use crate::services::registration::RegisteredFunction;
+use crate::worker_api::config::InvocationConfig;
+use anyhow::Result;
+use iluvatar_library::char_map::{Chars, WorkerCharMap};
+use iluvatar_library::clock::{get_global_clock, Clock};
+use iluvatar_library::transaction::TransactionId;
+use iluvatar_library::types::Compute;
+use parking_lot::Mutex;
+use std::sync::Arc;
+use time::OffsetDateTime;
+
+/// Internal state for the MICE (Machine‑Learning ICE) policy.
+///
+/// The policy maintains a single threshold `tau` that determines whether a
+/// job is dispatched to the first server (GPU) or the backup server (CPU).
+/// During an epoch of `m` dispatched jobs the policy collects the total
+/// workload routed to each device.  At the end of the epoch it computes
+/// empirical load estimates and nudges the threshold up or down to drive
+/// the observed load on the GPU toward a target derived from the total
+/// system load.  This implements the simple learning scheme described in
+/// Hyytiä & Righter “On Sequential Dispatching Policies” (Section IV‑C).
+#[derive(Debug)]
+struct MiceState {
+    /// Dispatch threshold (jobs with size < tau go to the GPU).
+    tau: f64,
+    /// Cumulative workload dispatched to the GPU during the current epoch.
+    gpu_work: f64,
+    /// Cumulative workload dispatched to the CPU during the current epoch.
+    cpu_work: f64,
+    /// Number of invocations dispatched during the current epoch.
+    count: u64,
+    /// Timestamp marking the start of the current epoch.
+    last_update: OffsetDateTime,
+}
+
+/// Mice dispatching policy.  This is a sequential policy that learns its
+/// size threshold online.  Jobs whose estimated GPU execution time is below
+/// `tau` are routed to the GPU; all others are routed to the CPU.  Every
+/// `m` invocations the threshold is adjusted by a small amount `epsilon`
+/// depending on whether the observed GPU load is below or above a target
+/// derived from the total load in the epoch.  The target uses the formula
+/// ρ̃₁ = ρ + α ρ⁴ (1 − ρ) from the paper with `alpha` configurable.
+#[derive(Debug)]
+pub struct Mice {
+    que_map: QueueMap,
+    cmap: WorkerCharMap,
+    /// Mutex protecting the mutable state of the learner.
+    state: Mutex<MiceState>,
+    /// Number of invocations in an epoch before the threshold is updated.
+    m: u64,
+    /// Step size used when increasing or decreasing the threshold.
+    epsilon: f64,
+    /// Parameter α used when computing the target GPU load.
+    alpha: f64,
+    clock: Clock,
+}
+
+impl Mice {
+
+    /// Local copy of landlord's GPU estimator (do not import; keep here).
+    /// Returns (filtered_estimate, residual_error).
+    fn get_gpu_est(&self, fqdn: &str, mqfq_est: f64) -> (f64, f64) {
+        // Previous filtered estimate and previous e2e GPU time.
+        let (est, e2e) = self
+            .cmap
+            .get_2(fqdn, Chars::EstGpu, iluvatar_library::char_map::Value::Avg, Chars::E2EGpu, iluvatar_library::char_map::Value::Avg);
+        let prev_est = if est == 0.0 { mqfq_est } else { est };
+        let prev_e2e = if e2e == 0.0 { mqfq_est } else { e2e };
+
+        // Kalman-like filter as used in landlord: xhat = alpha*prev_est + beta*mqfq_est + k*z
+        let z = prev_e2e - prev_est; // residual error
+        let alpha = 0.1;
+        let beta = 0.7;
+        let k = 1.0 - (beta + alpha);
+        let xhat = (alpha * prev_est) + (beta * mqfq_est) + k * z;
+
+        self.cmap.update(fqdn, Chars::EstGpu, xhat);
+        (xhat, z)
+    }
+
+    /// Construct a new Mice policy.  The invocation configuration is accepted
+    /// for parity with other policies but currently unused.  Reasonable
+    /// defaults are chosen for the learning parameters: `m` = 100,
+    /// `epsilon` = 0.1 and `alpha` = 0.8.  The initial threshold is set
+    /// conservatively to 10.0 seconds – applications may tune this via a
+    /// custom InvocationConfig in the future.
+    pub fn new(
+        _invocation_config: Arc<InvocationConfig>,
+        cmap: WorkerCharMap,
+        que_map: QueueMap,
+        tid: &TransactionId,
+    ) -> Result<Self> {
+        let clock = get_global_clock(tid)?;
+        // The initial threshold can be refined once system‑wide statistics
+        // become available; 10.0 seconds is a conservative starting point.
+        let initial_tau = 10.0;
+        Ok(Self {
+            que_map,
+            cmap,
+            state: Mutex::new(MiceState {
+                tau: initial_tau,
+                gpu_work: 0.0,
+                cpu_work: 0.0,
+                count: 0,
+                last_update: clock.now(),
+            }),
+            // Epoch length (M): adjust threshold every 100 invocations.
+            m: 100,
+            // Learning step size: adjust threshold in 0.1 second increments.
+            epsilon: 0.1,
+            // Alpha controlling the target load formula.
+            alpha: 0.8,
+            clock,
+        })
+    }
+
+    /// Internal helper to compute a size estimate for the given function.  The
+    /// estimated GPU execution time is used as the proxy for job size.  If no
+    /// data is available in the characteristics map the estimate defaults to
+    /// 0.0.  Negative or NaN values are coerced to zero.
+    fn estimate_size(&self, fid: &str) -> f64 {
+        let est = self.cmap.get_avg(fid, Chars::GpuExecTime);
+        if est.is_finite() && est > 0.0 {
+            est
+        } else {
+            0.0
+        }
+    }
+}
+
+impl DispatchPolicy for Mice {
+    fn choose(&self, reg: &Arc<RegisteredFunction>, tid: &TransactionId) -> (Compute, f64, f64) {
+
+        // Get queue estimates for both devices first (needed for MICE + sequential logic).
+        let ((gpu_mqfq_est, gpu_load), _) = match self.que_map.get(&Compute::GPU) {
+            Some(q) => (q.est_completion_time(reg, tid), Some(q.queue_tput())),
+            None => ((NO_ESTIMATE, NO_ESTIMATE), None),
+        };
+        let ((cpu_est_time, cpu_load), _) = match self.que_map.get(&Compute::CPU) {
+            Some(q) => (q.est_completion_time(reg, tid), Some(q.queue_tput())),
+            None => ((NO_ESTIMATE, NO_ESTIMATE), None),
+        };
+
+        // Smooth the GPU execution time estimate just like landlord does (local copy).
+        let (gpu_est_exec, _err) = self.get_gpu_est(&reg.fqdn, gpu_mqfq_est);
+
+        // Use the (filtered) GPU exec estimate as our job "size" proxy; fall back to char map avg.
+        let mut size = gpu_est_exec;
+        if size <= 0.0 {
+            size = self.cmap.get_avg(&reg.fqdn, Chars::GpuExecTime);
+        }
+        if size <= 0.0 {
+            size = 1.0; // conservative fallback
+        }
+
+        // Determine which server is currently shorter by est. completion time.
+        let gpu_is_shorter = match (gpu_mqfq_est, cpu_est_time) {
+            (g, c) if g >= 0.0 && c >= 0.0 => g <= c,
+            (g, _) if g >= 0.0 => true,
+            (_, c) if c >= 0.0 => false,
+            _ => true,
+        };
+
+        // Sequential rule (GPU is first server): if GPU is shorter, admit iff size < tau; else send to CPU.
+        let now = self.clock.now();
+        let mut st = self.state.lock();
+        let use_gpu = if gpu_is_shorter { size < st.tau } else { false };
+
+        // Update per-epoch workload counters.
+        if use_gpu {
+            st.gpu_work += size;
+        } else {
+            st.cpu_work += size;
+        }
+        st.count += 1;
+
+        // End of epoch? adjust tau using target load rule from the paper.
+        if st.count >= st.m && st.last_update < now {
+            let dt = (now - st.last_update).as_seconds_f64().max(1e-6);
+            let rho_gpu = st.gpu_work / dt;
+            let rho_cpu = st.cpu_work / dt;
+            let rho = rho_gpu + rho_cpu;
+
+            // target load for server 1 (GPU): \tilde{\rho}_1 = \rho + \alpha \rho^4 (1-\rho)
+            let target_gpu = rho + st.alpha * (rho.powi(4)) * (1.0 - rho);
+            if rho_gpu < target_gpu {
+                st.tau += st.epsilon;
+            } else {
+                st.tau = (st.tau - st.epsilon).max(0.0);
+            }
+            st.gpu_work = 0.0;
+            st.cpu_work = 0.0;
+            st.count = 0;
+            st.last_update = now;
+        }
+        drop(st);
+
+        // Finally, return the device with the latest est. completion info.
+        if use_gpu {
+            (Compute::GPU, gpu_load, gpu_mqfq_est)
+        } else {
+            (Compute::CPU, cpu_load, cpu_est_time)
+        }
+
+    }
+}

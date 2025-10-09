@@ -1,0 +1,179 @@
+- hosts: workers
+  vars_files:
+    - group_vars/all.yml
+    - group_vars/host_addresses.yml
+  vars:
+    expected: "Connection failure: [Errno 104] Connection reset by peer"
+    host_group: "{{ groups['workers'] }}"
+    assigned_port: "{{ (worker.port | int + host_group.index(inventory_hostname)) }}"
+    bin_dir: "/tmp/iluvatar/bin"
+    exe_dest: "{{bin_dir}}/{{ worker.bin_name }}"
+    config_dest: "{{bin_dir}}/{{ inventory_hostname }}.json"
+    __architecture: "{{ servers[ansible_host].architecture | default('x86_64-unknown-linux-gnu') }}"
+    def_bin_src: "{{iluvatar_home}}/target/{{__architecture}}/{{target}}"
+    __bin_src: "{{ worker_bin_src | default(def_bin_src) }}"
+    __remote_bin_src: "{{ remote_bin_src | default(false) }}"
+    __worker_address: "{{ worker_address | default(servers[ansible_host].internal_ip) }}"
+    __hardware_interface: "{{ hardware_interface | default(servers[ansible_host].hardware_interface) }}"
+    SIGINT: 2
+    ansible_proxy_env:
+      # This section is for environment variables defined/managed by Ansible ONLY. 
+      # Other config should be passed in via 'worker.environment'
+      "RUST_BACKTRACE": 1
+      "ILUVATAR_WORKER__name": "{{ inventory_hostname }}"
+      "ILUVATAR_WORKER__port": "{{ assigned_port }}"
+      "ILUVATAR_WORKER__address" : "{{ __worker_address }}"
+      "ILUVATAR_WORKER__logging__basename": "{{ inventory_hostname }}"
+      "ILUVATAR_WORKER__load_balancer_host" : "{{ controller.host if cluster else '' }}"
+      "ILUVATAR_WORKER__load_balancer_port" : "{{ controller.port }}"
+      "ILUVATAR_WORKER__influx__host" : "{{ influx.address }}"
+      "ILUVATAR_WORKER__influx__org" : "{{ influx.organization }}"
+      "ILUVATAR_WORKER__influx__token" : "{{ hostvars[ groups['influx']|first ].influx_token | default('') }}"
+      "ILUVATAR_WORKER__networking__hardware_interface" : "{{ __hardware_interface }}"
+
+    proxy_env: "{{ ansible_proxy_env | combine(worker.environment, recursive=True) }}"
+
+  tasks:
+  - name: Create bin directory
+    file:
+      path: "{{bin_dir}}"
+      state: directory
+      recurse: yes
+    become: yes
+      
+  - name: copy worker executable
+    ansible.builtin.copy:
+      src: "{{__bin_src}}/{{worker.bin_name}}"
+      dest: "{{exe_dest}}"
+      mode: "preserve"
+      remote_src: "{{__remote_bin_src}}"
+    become: yes
+
+  - name: copy worker config
+    ansible.builtin.copy:
+      src: "{{__bin_src}}/{{worker.config_name}}"
+      dest: "{{config_dest}}"
+      mode: "preserve"
+    become: yes
+
+  - name: Get running worker process
+    shell: "ps -ef | grep -v grep | grep -w {{ worker.bin_name }} | awk '{print $2}'"
+    register: running_worker
+    when: mode == "clean"
+
+  - name: Kill running worker process on localhost
+    shell: "kill -s INT {{ item }}"
+    with_items: "{{ running_worker.stdout_lines }}"
+    become: yes
+    when: (ansible_host == "127.0.0.1" or ansible_host == "localhost") and mode == "clean"
+    run_once: true
+
+  - name: Kill running worker process distrib
+    shell: "kill -9 {{ item }}"
+    when: (ansible_host != "127.0.0.1" and ansible_host != "localhost") and mode == "clean"
+    with_items: "{{ running_worker.stdout_lines }}"
+    become: yes
+
+  - name: clean localhost
+    ansible.builtin.command: 
+      argv: 
+        - "{{exe_dest}}"
+        - -c 
+        - "{{config_dest}}"
+        - clean
+    become: yes
+    when: (ansible_host == "127.0.0.1" or ansible_host == "localhost") and mode == "clean"
+    run_once: true
+    register: clean_cmd
+    failed_when: clean_cmd.rc != 0
+    environment: "{{proxy_env}}"
+
+  - name: clean distrib host
+    ansible.builtin.command: 
+      argv: 
+        - "{{exe_dest}}"
+        - -c 
+        - "{{config_dest}}"
+        - clean
+    become: yes
+    when: mode == "clean"
+    register: clean_cmd
+    failed_when: clean_cmd.rc != 0
+    environment: "{{proxy_env}}"
+
+  - name: run worker executable
+    ansible.builtin.command: 
+      argv: 
+        - "{{exe_dest}}"
+        - -c 
+        - "{{config_dest}}"
+    become: yes
+    async: 2592000               # 60*60*24*30 – 1 month
+    poll: 0
+    when: mode == "deploy"
+    environment: "{{proxy_env}}"
+    register: worker_output
+
+  - name: debug print
+    # when: ansible_host == "127.0.0.1" or ansible_host == "localhost"
+    run_once: true
+    debug:
+      msg: "{{ worker_output }}"
+      
+  - name: run worker executable through perf
+    ansible.builtin.command: 
+      argv: 
+        - perf
+        - record
+        - -F
+        - "{{perf_record_freq_hz}} | default(1000)"
+        - -g
+        - --user-callchains
+        - --inherit
+        - -o 
+        - "{{worker_log_dir}}/perf.data"
+        - "{{exe_dest}}"
+        - -c 
+        - "{{config_dest}}"
+    become: yes
+    async: 2592000               # 60*60*24*30 – 1 month
+    poll: 0
+    when: mode == "perf"
+    environment: "{{proxy_env}}"
+    register: perf_worker_output
+
+  - name: Wait until the worker on this host is up and running
+    block:
+    - name: wait until the worker on this host is up and running
+      ansible.builtin.uri:
+        url:
+          "http://{{__worker_address}}:{{assigned_port}}/ping"
+        validate_certs: "no"
+        # RPC server doesn't accept basic HTTP connections
+        # but we can try connecting to it once it's up and know it's alive
+        status_code: [-1]
+      register: result
+      until: result.msg == expected
+      retries: 5
+      delay: 2
+      when: mode == "deploy" or mode == "perf"
+
+    rescue:
+    - name: debug print
+      run_once: true
+      debug:
+        msg: "{{ worker_output }}"
+
+    - name: Read worker stdout
+      slurp:
+        src: "{{ worker_output['results_file'] }}"
+      register: file_data
+      become: yes
+
+    - name: Print stdout
+      debug:
+        msg: "{{ file_data.content | b64decode }}"
+
+    # - name: Fail deploy
+    #   ansible.builtin.fail:
+    #     msg: "Connecting to worker failed!"

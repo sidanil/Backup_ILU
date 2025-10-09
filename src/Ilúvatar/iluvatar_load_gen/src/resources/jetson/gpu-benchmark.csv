@@ -1,0 +1,5 @@
+name,image_name,compute,isolation,memory,args
+imagenet,docker.io/aarehman/tf_imagenet-iluvatar-gpu:aarch64,CPU|GPU,DOCKER|CONTAINERD,3072,
+squeezenet,docker.io/aarehman/tf_squeezenet-iluvatar-gpu:aarch64,CPU|GPU,DOCKER|CONTAINERD,3072,
+cupy,docker.io/aarehman/cupy-iluvatar-gpu:aarch64,CPU|GPU,DOCKER|CONTAINERD,3072,
+onnx-roberta,docker.io/aarehman/onnx-roberta-iluvatar-gpu:aarch64,CPU|GPU,DOCKER|CONTAINERD,3072,

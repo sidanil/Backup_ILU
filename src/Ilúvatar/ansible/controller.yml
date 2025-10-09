@@ -1,0 +1,110 @@
+- hosts: controller
+  vars:
+    expected: "Connection failure: [Errno 104] Connection reset by peer"
+    host_group: "{{ groups['controller'] }}"
+    host_group_size: "{{ host_group | length }}"
+    bin_dir: "/tmp/iluvatar/bin"
+    exe_dest: "{{bin_dir}}/{{ controller.bin_name }}"
+    config_dest: "{{bin_dir}}/{{ controller.config_name }}"
+    __architecture: "{{ servers[ansible_host].architecture | default('x86_64-unknown-linux-gnu') }}"
+    def_bin_src: "{{iluvatar_home}}/target/{{__architecture}}/{{target}}"
+    __bin_src: "{{ controller_bin_src | default(def_bin_src) }}"
+    __remote_bin_src: "{{ remote_bin_src | default(false) }}"
+    __controller_address: "{{ controller_address | default(servers[ansible_host].internal_ip) }}"
+    coded_proxy_env:
+      # This section is for environment variables defined/managed by Ansible ONLY. 
+      # Other config should be passed in via 'controller.environment'
+      "ILUVATAR_CONTROLLER__name": "{{ controller.host }}"
+      "ILUVATAR_CONTROLLER__port": "{{ controller.port }}"
+      "ILUVATAR_CONTROLLER__address": "{{ __controller_address | default('localhost') }}"
+      "ILUVATAR_CONTROLLER__influx__host" : "{{ influx.address }}"
+      "ILUVATAR_CONTROLLER__influx__org" : "{{ influx.organization }}"
+      "ILUVATAR_CONTROLLER__influx__token" : "{{ hostvars[ groups['influx']|first ].influx_token }}"
+    proxy_env: "{{ coded_proxy_env | combine(controller.environment, recursive=True) }}"
+
+  vars_files:
+    - group_vars/all.yml
+
+  tasks:
+  - name: limit count
+    ansible.builtin.assert:
+      that: host_group_size == "1"
+      fail_msg: "Can only support one controller"
+      success_msg: "Good on number of controllers, got {{ host_group_size }}"
+
+  - name: Get running controller process
+    shell: "ps -ef | grep -v grep | grep -w {{ controller.bin_name }} | awk '{print $2}'"
+    register: running_lb
+    when: mode == "clean"
+
+  - name: Kill running controller process
+    shell: "kill {{ item }}"
+    with_items: "{{ running_lb.stdout_lines }}"
+    become: yes
+    when: mode == "clean"
+    
+  - name: Create bin directory
+    file:
+      path: "{{bin_dir}}"
+      state: directory
+      recurse: yes
+    when: mode == "deploy"
+    become: yes
+
+  - name: copy controller executable
+    ansible.builtin.copy:
+      src: "{{__bin_src}}/{{controller.bin_name}}"
+      dest: "{{exe_dest}}"
+      mode: "preserve"
+      remote_src: "{{__remote_bin_src}}"
+    when: mode == "deploy"
+    become: yes
+
+  - name: copy controller config
+    ansible.builtin.copy:
+      src: "{{__bin_src}}/{{controller.config_name}}"
+      dest: "{{config_dest}}"
+      mode: "preserve"
+      remote_src: "{{__remote_bin_src}}"
+    when: mode == "deploy"
+    become: yes
+
+  - name: run controller executable
+    ansible.builtin.command: 
+      argv: 
+        - "{{exe_dest}}"
+        - -c 
+        - "{{config_dest}}"
+    become: yes
+    async: 2592000               # 60*60*24*30 – 1 month
+    poll: 0
+    when: mode == "deploy"
+    environment: "{{ proxy_env }}"
+    register: controller_output
+
+  - name: debug print
+    when: mode == "deploy"
+    debug:
+      msg: "{{ controller_output }}"
+
+  - name: wait until the controller on this host is up and running
+    uri:
+      url:
+        "http://{{__controller_address}}:{{controller.port}}/ping"
+      validate_certs: "no"
+      # RPC server doesn't accept basic HTTP connections
+      # but we can try connecting to it once it's up and know it's alive
+      status_code: [-1] #[-1, 0.9, 1.1]
+    register: result
+    until: result.msg == expected
+    retries: 10
+    delay: 5
+    when: mode == "deploy"
+
+  - name: Copy controller logs
+    ansible.posix.synchronize:
+      src: "{{ controller_log_dir }}"
+      dest: "{{ log_copy_dir }}"
+      mode: pull
+      recursive: true
+    when: mode == "logs"
