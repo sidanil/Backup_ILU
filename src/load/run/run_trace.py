@@ -400,6 +400,13 @@ def run_live(
             kwargs["host"] = held_host.address
             print(f"Running {results_dir} on {kwargs['host']}")
 
+            config_dump = os.path.join(results_dir, "config.json")
+            # print("Json Dump location :" + config_dump)
+            with open(config_dump, 'w', encoding='utf-8') as f:
+                # print("Dump json")
+                json.dump(kwargs.to_dict(), f, ensure_ascii=False, indent=4)
+                
+
             with open(log_file, "w") as log_file_fp:
                 try:
                     _pre_run_cleanup(
